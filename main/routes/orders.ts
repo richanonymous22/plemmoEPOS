@@ -1,0 +1,1012 @@
+import { createHash } from 'crypto';
+import { Router, Request, Response } from 'express';
+import { getDatabase, generateOrderNumber, now, parseItemJson, parseRowJson, withTxn, verifyPin, getSettingValue, insertOrderItemAddons, attachEffectiveAddons, utcDayBounds, utcTodayDate } from '../db';
+import {
+  calculateConfiguredChargeTaxes,
+  calculateItemTax,
+  combineItemAndChargeTaxes,
+  getActiveCountryPack,
+  getConfiguredChargeTaxCategories,
+} from '../services/tax';
+import { applyPayableRounding } from '../services/tax-engine';
+import { notifyKdsUpdate, notifyOrderUpdated } from '../services/kds';
+import { cloudSync } from '../services/cloud-sync';
+import { validateOrderNotes, validateItemNotes } from '../core/notes-validation';
+import { createSale, addSaleItems, validateLineAddonGroupLimits } from '../core/sale';
+import { requireRole } from '../middleware/security';
+import { requirePermission } from '../middleware/authorize';
+import { getCurrentLocationId } from '../core/location';
+
+const router = Router();
+const MAX_ORDER_IDEMPOTENCY_KEY_LENGTH = 128;
+
+function orderIdempotencyKey(req: Request): string | null {
+  const supplied = req.get('Idempotency-Key')?.trim();
+  if (!supplied) return null;
+  if (supplied.length > MAX_ORDER_IDEMPOTENCY_KEY_LENGTH || !/^[\x21-\x7e]+$/.test(supplied)) {
+    throw Object.assign(new Error('Idempotency-Key is invalid or too long'), { statusCode: 400 });
+  }
+  return supplied;
+}
+
+// Rate limiting for PIN validation (simple in-memory)
+const pinAttempts = new Map<string, { count: number; resetAt: number }>();
+const PIN_MAX_ATTEMPTS = 5;
+const PIN_WINDOW_MS = 15 * 60 * 1000; // 15 minutes
+
+export function checkPinRateLimit(key: string): boolean {
+  const now = Date.now();
+  const entry = pinAttempts.get(key);
+  if (!entry || now > entry.resetAt) {
+    pinAttempts.set(key, { count: 1, resetAt: now + PIN_WINDOW_MS });
+    return true;
+  }
+  if (entry.count >= PIN_MAX_ATTEMPTS) return false;
+  entry.count++;
+  return true;
+}
+
+function syncCustomerTagCounts(db: any, customerId: string, items: { product_id: string; quantity: number }[]) {
+  const row = db.prepare('SELECT tag_counts FROM customers WHERE id = ?').get(customerId) as any;
+  if (!row) return;
+  let counts: Record<string, number> = {};
+  try { counts = row.tag_counts ? JSON.parse(row.tag_counts) : {}; } catch { counts = {}; }
+  for (const item of items) {
+    const product = db.prepare('SELECT tags FROM products WHERE id = ?').get(item.product_id) as any;
+    if (!product?.tags) continue;
+    let tags: string[] = [];
+    try { tags = JSON.parse(product.tags); } catch { continue; }
+    for (const tag of tags) {
+      if (tag && typeof tag === 'string') counts[tag] = (counts[tag] || 0) + (item.quantity || 1);
+    }
+  }
+  db.prepare('UPDATE customers SET tag_counts = ?, updated_at = ? WHERE id = ?')
+    .run(JSON.stringify(counts), now(), customerId);
+}
+
+
+router.get('/', requireRole('owner', 'manager', 'cashier', 'waiter'), (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const db = getDatabase();
+    const wheres: string[] = [];
+    const params: any[] = [];
+
+    if (req.query.status) {
+      const statuses = (req.query.status as string).split(',');
+      if (statuses.length === 1) {
+        wheres.push('status = ?');
+        params.push(statuses[0]);
+      } else {
+        wheres.push(`status IN (${statuses.map(() => '?').join(',')})`);
+        params.push(...statuses);
+      }
+    }
+    if (req.query.type) {
+      wheres.push('type = ?');
+      params.push(req.query.type);
+    }
+    // #208: `today` is the UTC day, as a range filter (was UTC date() that
+    // wrapped the column and blocked `idx_orders_created_at`). `start_date` /
+    // `end_date` add a range filter so the UI can actually load older pages
+    // — combined with the cursor, this is what gives us real pagination
+    // instead of "latest 50 forever".
+    if (req.query.today && req.query.today !== '0' && req.query.today !== 'false') {
+      const [s, e] = utcDayBounds(utcTodayDate());
+      wheres.push('created_at >= ? AND created_at < ?');
+      params.push(s, e);
+    } else {
+      const startDate = typeof req.query.start_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.start_date) ? req.query.start_date : null;
+      const endDate = typeof req.query.end_date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(req.query.end_date) ? req.query.end_date : null;
+      if (startDate) {
+        wheres.push('created_at >= ?');
+        params.push(utcDayBounds(startDate)[0]);
+      }
+      if (endDate) {
+        wheres.push('created_at < ?');
+        params.push(utcDayBounds(endDate)[1]);
+      }
+    }
+    if (req.query.table_id) {
+      wheres.push('table_id = ?');
+      params.push(req.query.table_id);
+    }
+    if (user.role === 'waiter') {
+      wheres.push('user_id = ?');
+      params.push(user.userId);
+    }
+    // Cursor pagination: `before` / `after` are ORDER BY keys (created_at),
+    // composed with `id` to break ties when many orders share a second.
+    if (typeof req.query.before_id === 'string' && /^\d+$/.test(req.query.before_id)) {
+      const oid = parseInt(req.query.before_id, 10);
+      const ref = db.prepare('SELECT created_at FROM orders WHERE id = ?').get(oid) as { created_at: string } | undefined;
+      if (ref) {
+        wheres.push('(created_at, id) < (?, ?)');
+        params.push(ref.created_at, oid);
+      }
+    }
+
+    const whereSql = wheres.length > 0 ? `WHERE ${wheres.join(' AND ')}` : '';
+    // #208: cap page size even when clients omit per_page (the original
+    // "unbounded" default made GET /orders on the tables page load the entire
+    // active-order history with the N+1 below).
+    const requestedPerPage = req.query.per_page ? parseInt(req.query.per_page as string, 10) : NaN;
+    const perPage = Number.isInteger(requestedPerPage) && requestedPerPage > 0
+      ? Math.min(requestedPerPage, 500)
+      : 50;
+    const perPagePlusOne = perPage + 1;
+
+    const orders = db.prepare(`
+      SELECT * FROM orders
+      ${whereSql}
+      ORDER BY created_at DESC, id DESC
+      LIMIT ?
+    `).all(...params, perPagePlusOne) as any[];
+
+    const hasMore = orders.length > perPage;
+    const pageOrders = hasMore ? orders.slice(0, perPage) : orders;
+    const nextCursor = hasMore ? pageOrders[pageOrders.length - 1].id : null;
+
+    // #208: replace the per-order N+1 (5 queries × N) with one IN() per
+    // relation, then assemble. Measured ~300+ queries per poll → ~6.
+    const ordersWithRelations = batchHydrateOrders(db, pageOrders);
+
+    res.json({
+      orders: ordersWithRelations,
+      ...(nextCursor !== null && { nextCursor }),
+    });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * Batch the relations (items+addons, table, customer, bill+loyalty) for a
+ * page of orders into 5 IN() queries instead of N per-order prepared calls.
+ * Used by GET /orders and kept here so the orders route owns its own data
+ * shape. #208
+ */
+function batchHydrateOrders(db: ReturnType<typeof getDatabase>, orders: any[]) {
+  if (orders.length === 0) return [];
+  // Normalize JSON text columns (tax_breakdown/tax_snapshot on orders and
+  // items) so the list endpoint matches GET /orders/:id. parseRowJson is
+  // idempotent, so the /:id path passing an already-parsed row is fine.
+  const parsedOrders = orders.map(parseRowJson);
+  const ids = parsedOrders.map((o) => o.id);
+  const tableIds = Array.from(new Set(parsedOrders.map((o: any) => o.table_id).filter(Boolean)));
+  const customerIds = Array.from(new Set(parsedOrders.map((o: any) => o.customer_id).filter(Boolean)));
+
+  const orderIdsCsv = `(${ids.map(() => '?').join(',')})`;
+  const itemsRows = db.prepare(`SELECT * FROM order_items WHERE order_id IN ${orderIdsCsv} ORDER BY order_id, id`).all(...ids).map(parseItemJson);
+  // #208: a single call to attachEffectiveAddons batches all addons across
+  // all items into one IN() query against order_item_addons. Re-group the
+  // result back by order_id for the per-order payload below.
+  const itemsWithAddons = attachEffectiveAddons(db, itemsRows as any[]);
+  const itemsByOrder = new Map<number, any[]>();
+  for (const it of itemsWithAddons) {
+    const list = itemsByOrder.get(it.order_id) || [];
+    list.push(it);
+    itemsByOrder.set(it.order_id, list);
+  }
+
+  const tablesById = new Map<string, any>();
+  if (tableIds.length > 0) {
+    const ph = tableIds.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT * FROM tables WHERE id IN (${ph})`).all(...tableIds) as any[];
+    for (const t of rows) tablesById.set(t.id, t);
+  }
+  const customersById = new Map<string, any>();
+  if (customerIds.length > 0) {
+    const ph = customerIds.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT * FROM customers WHERE id IN (${ph})`).all(...customerIds);
+    for (const c of rows as any[]) customersById.set(c.id, parseRowJson(c));
+  }
+  const billsByOrderId = new Map<number, any[]>();
+  const billsById = new Map<number, any>();
+  const billRows = db.prepare(`SELECT * FROM bills WHERE order_id IN ${orderIdsCsv}`).all(...ids) as any[];
+  for (const b of billRows) {
+    const parsed = parseRowJson(b);
+    const siblings = billsByOrderId.get(parsed.order_id) || [];
+    siblings.push(parsed);
+    billsByOrderId.set(parsed.order_id, siblings);
+    billsById.set(parsed.id, parsed);
+  }
+  const ledgerByBillId = new Map<number, number>();
+  if (billsById.size > 0) {
+    const billIds = Array.from(billsById.keys());
+    const ph = billIds.map(() => '?').join(',');
+    const rows = db.prepare(`SELECT bill_id, COALESCE(SUM(amount),0) as total FROM loyalty_ledger WHERE bill_id IN (${ph}) AND type = 'credit' GROUP BY bill_id`).all(...billIds) as { bill_id: number; total: number }[];
+    for (const r of rows) ledgerByBillId.set(r.bill_id, r.total);
+  }
+
+  return parsedOrders.map((order) => {
+    const itemList = itemsByOrder.get(order.id) || [];
+    const tableRow = order.table_id ? tablesById.get(order.table_id) : null;
+    const table = tableRow ? { ...tableRow, name: tableRow.number } : null;
+    const customer = order.customer_id ? customersById.get(order.customer_id) : null;
+    const bills = billsByOrderId.get(order.id) || [];
+    for (const billRow of bills) {
+      if (billRow.customer_id) billRow.points_earned = ledgerByBillId.get(billRow.id) || 0;
+    }
+    const bill = bills.find((row) => row.payment_status !== 'paid') || bills[0] || null;
+    return { ...order, items: itemList, table, customer, bill, bills };
+  });
+}
+
+router.get('/:id', requireRole('owner', 'manager', 'cashier', 'waiter'), (req: Request, res: Response) => {
+  try {
+    const user = (req as any).user;
+    const db = getDatabase();
+    const order = parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id));
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (user.role === 'waiter' && (order as any).user_id !== user.userId) {
+      return res.status(403).json({ error: 'Waiters can only view their own orders' });
+    }
+
+    // #208: collapse the per-order N+1 (5 queries: items/addons/table/customer/bill/loyalty)
+    // into the same batchHydrateOrders used by the list endpoint. Previously
+    // 6 prepared calls per single detail click.
+    const [hydrated] = batchHydrateOrders(db, [order]);
+    res.json({ order: hydrated });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+/**
+ * Create a sale.
+ *
+ * PHASE 2A: the business logic that used to live inline here now lives in
+ * SaleService (main/core/sale.ts). This handler is deliberately thin — it
+ * translates HTTP into a domain call and back, and owns the post-commit
+ * side effects that must not run inside the transaction.
+ *
+ * The request hash is still computed over the raw body, not over the mapped
+ * domain input, so idempotency records written before this refactor still
+ * match on retry.
+ */
+router.post('/', requirePermission('sales.create', { locationId: () => getCurrentLocationId() }), (req: Request, res: Response) => {
+  try {
+    const body = req.body || {};
+    const { table_id, customer_id, type, guest_count, special_instructions, packaging_charge, delivery_charge, items } = body;
+    const idempotencyKey = orderIdempotencyKey(req);
+    const idempotencyUserId = String((req as any).user.userId);
+    const requestHash = idempotencyKey
+      ? createHash('sha256').update(JSON.stringify(body)).digest('hex')
+      : null;
+    // Always the authenticated caller, never client-supplied — trusting a
+    // client-sent user_id would let staff spoof order attribution.
+    const authenticatedUserId = (req as any).user.userId;
+
+    const result = createSale({
+      channel: type,
+      lines: items,
+      cashierUserId: authenticatedUserId,
+      customerId: customer_id ?? null,
+      tableId: table_id ?? null,
+      guestCount: guest_count ?? null,
+      specialInstructions: special_instructions ?? null,
+      packagingCharge: packaging_charge ?? 0,
+      deliveryCharge: delivery_charge ?? 0,
+      idempotency: idempotencyKey && requestHash
+        ? { key: idempotencyKey, requestHash, userId: idempotencyUserId }
+        : null,
+    });
+
+    // Post-commit side effects. Deliberately outside the transaction: a KDS
+    // broadcast or a cloud outbox row for a sale that then rolled back would
+    // be worse than a slightly late notification.
+    if (!result.idempotentReplay) {
+      notifyKdsUpdate();
+      cloudSync.recordOrderChanged(result.sale.id, 'order.created');
+
+      if (customer_id) {
+        try {
+          syncCustomerTagCounts(getDatabase(), customer_id, items);
+        } catch (err) {
+          console.error('[Orders] Tag sync failed:', err);
+        }
+      }
+    }
+
+    res.status(result.idempotentReplay ? 200 : 201).json({ order: Object.assign({}, result.sale, { items: result.lines }) });
+  } catch (error: any) {
+    const statusCode = error?.statusCode || 500;
+    // Client errors are answered, not logged — only unexpected failures are
+    // worth a line in a merchant's log file.
+    if (statusCode >= 500) {
+      console.error('[Orders] Create error:', error);
+    }
+    res.status(statusCode).json({ error: error?.statusCode ? error.message : "Internal server error" });
+  }
+});
+
+/**
+ * Add lines to an existing sale.
+ *
+ * PHASE MILESTONE 2: business logic moved to SaleService.addSaleItems
+ * (main/core/sale.ts), which shares its per-line work with createSale via
+ * the internal persistSaleLine helper. This handler keeps two checks that
+ * stayed in the route deliberately — see the comment on addSaleItems for why.
+ */
+router.post('/:id/items', requirePermission('sales.create', { locationId: () => getCurrentLocationId() }), (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    // Kept in the route: a simple, self-contained guard with nothing to
+    // share with createSale, checked first exactly as before.
+    if (db.prepare('SELECT 1 FROM bills WHERE order_id = ? AND split_group_id IS NOT NULL LIMIT 1').get(req.params.id)) {
+      return res.status(409).json({ error: 'Items cannot be changed after a check has been split' });
+    }
+
+    const body = req.body || {};
+    const { items, special_instructions } = body;
+    const idempotencyKey = orderIdempotencyKey(req);
+    const idempotencyUserId = String((req as any).user.userId);
+    const requestHash = idempotencyKey
+      ? createHash('sha256').update(JSON.stringify({ order_id: req.params.id, items, special_instructions })).digest('hex')
+      : null;
+
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    // Kept in the route: an authorization decision tied to the HTTP caller's
+    // role, not a sale business rule — belongs beside requireRole, not in a
+    // service with no Express dependency.
+    const authUser = (req as any).user;
+    if (authUser?.role === 'waiter' && order.user_id !== authUser.userId) {
+      return res.status(403).json({ error: 'Waiters can only modify their own orders' });
+    }
+
+    const result = addSaleItems({
+      saleId: req.params.id as string,
+      lines: items,
+      specialInstructions: special_instructions !== undefined ? { value: special_instructions } : undefined,
+      actorUserId: authUser?.userId ?? null,
+      idempotency: idempotencyKey && requestHash
+        ? { key: idempotencyKey, requestHash, userId: idempotencyUserId }
+        : null,
+    });
+
+    if (!result.idempotentReplay) {
+      cloudSync.recordOrderChanged(req.params.id as string, 'order.updated');
+      notifyKdsUpdate();
+    }
+
+    // Always 200 here, replay or not — matches the inherited route, which
+    // never gave add-items its own 201 the way create-sale does.
+    res.json({ order: Object.assign({}, result.sale, { items: result.lines }) });
+  } catch (error: any) {
+    const statusCode = error?.statusCode || 500;
+    if (statusCode >= 500) {
+      console.error('[Orders] Add items error:', error);
+    }
+    res.status(statusCode).json({ error: error?.statusCode ? error.message : "Internal server error" });
+  }
+});
+
+router.patch('/:id/status', requireRole('owner', 'manager', 'cashier', 'chef', 'waiter'), (req: Request, res: Response) => {
+  try {
+    const { status, reason, override_pin, free_table } = req.body;
+
+    if (!status) {
+      return res.status(400).json({ error: 'Status is required' });
+    }
+
+    const validStatuses = ['preparing', 'ready', 'served', 'completed', 'cancelled'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({ error: `Invalid status. Use: ${validStatuses.join(', ')}` });
+    }
+
+    // reason is optional for cancellation
+
+    const db = getDatabase();
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id);
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    const authUser = (req as any).user;
+    if (authUser?.role === 'waiter' && String((order as any).user_id) !== String(authUser.userId)) {
+      return res.status(403).json({ error: 'Waiters can only modify their own orders' });
+    }
+
+    // Override validation: cancelling an order in preparing+ status (or with items in preparing+) requires manager PIN
+    const statusOrder = ['pending', 'preparing', 'ready', 'served', 'completed'];
+    const currentStatusIndex = statusOrder.indexOf((order as any).status);
+    const hasItemsInProgress = db.prepare(`
+      SELECT 1 FROM order_items 
+      WHERE order_id = ? AND status IN ('preparing', 'ready', 'served', 'completed') 
+      LIMIT 1
+    `).get(req.params.id) !== undefined;
+    const requiresOverride = (currentStatusIndex > 0 || hasItemsInProgress) && status === 'cancelled';
+
+    if (requiresOverride) {
+      if (!override_pin) {
+        return res.status(400).json({ error: 'Manager PIN required to cancel order in progress' });
+      }
+
+      // Rate limit PIN attempts per IP
+      const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+      const rateLimitKey = `pin:${clientIp}:${req.params.id}`;
+      if (!checkPinRateLimit(rateLimitKey)) {
+        return res.status(429).json({ error: 'Too many PIN attempts. Try again in 15 minutes.' });
+      }
+
+      // Validate PIN against active owner/manager accounts only
+      const user = db.prepare("SELECT * FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL AND role IN ('owner', 'manager')")
+        .all()
+        .find((u: any) => verifyPin(u.pin_hash, override_pin));
+
+      if (!user) {
+        return res.status(403).json({ error: 'Invalid manager PIN' });
+      }
+    }
+
+    const nowStr = now();
+
+    const { updatedOrder, orderItems, table } = withTxn(() => {
+      switch (status) {
+        case 'preparing':
+          db.prepare('UPDATE orders SET status = ?, cooking_started_at = ?, updated_at = ? WHERE id = ?')
+            .run(status, nowStr, nowStr, req.params.id);
+          break;
+
+        case 'ready':
+          db.prepare('UPDATE orders SET status = ?, ready_at = ?, updated_at = ? WHERE id = ?')
+            .run(status, nowStr, nowStr, req.params.id);
+          break;
+
+        case 'served':
+          db.prepare('UPDATE orders SET status = ?, served_at = ?, updated_at = ? WHERE id = ?')
+            .run(status, nowStr, nowStr, req.params.id);
+          break;
+
+        case 'completed':
+          db.prepare('UPDATE orders SET status = ?, completed_at = ?, updated_at = ? WHERE id = ?')
+            .run(status, nowStr, nowStr, req.params.id);
+          db.prepare(`
+            UPDATE order_items SET status = 'served', updated_at = ?
+            WHERE order_id = ? AND status IN ('pending', 'preparing', 'ready')
+          `).run(nowStr, req.params.id);
+          if ((order as any).table_id) {
+            db.prepare("UPDATE tables SET status = 'available', updated_at = ? WHERE id = ?")
+              .run(nowStr, (order as any).table_id);
+          }
+          break;
+
+        case 'cancelled': {
+          const items = db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(req.params.id) as any[];
+          for (const item of items) {
+            const product = db.prepare('SELECT * FROM products WHERE id = ?').get(item.product_id) as any;
+            if (product && product.track_inventory) {
+              db.prepare('UPDATE products SET stock_quantity = stock_quantity + ?, updated_at = ? WHERE id = ?')
+                .run(item.quantity, nowStr, product.id);
+            }
+          }
+          db.prepare('UPDATE orders SET status = ?, cancelled_at = ?, cancellation_reason = ?, updated_at = ? WHERE id = ?')
+            .run(status, nowStr, reason, nowStr, req.params.id);
+          // Only free table if explicitly requested (default: true for backward compatibility)
+          if ((order as any).table_id && free_table !== false) {
+            db.prepare("UPDATE tables SET status = 'available', updated_at = ? WHERE id = ?")
+              .run(nowStr, (order as any).table_id);
+          }
+          break;
+        }
+      }
+
+      const updatedOrder = parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id)) as any;
+      const orderItems = attachEffectiveAddons(db, db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(req.params.id).map(parseItemJson) as any[]);
+      const tableRow2 = updatedOrder.table_id ? db.prepare('SELECT * FROM tables WHERE id = ?').get(updatedOrder.table_id) as any : null;
+      const table = tableRow2 ? { ...tableRow2, name: tableRow2.number } : null;
+      return { updatedOrder, orderItems, table };
+    });
+
+    cloudSync.recordOrderChanged(req.params.id as string, `order.${status}`);
+    notifyKdsUpdate();
+
+    res.json({ order: Object.assign({}, updatedOrder, { items: orderItems, table }) });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.patch('/:id/customer', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+
+    const { customer_id } = req.body;
+
+    // Validate customer exists if providing one
+    if (customer_id) {
+      const customer = db.prepare('SELECT * FROM customers WHERE id = ?').get(customer_id);
+      if (!customer) {
+        return res.status(404).json({ error: 'Customer not found' });
+      }
+    }
+
+    const nowStr = now();
+    const updatedOrder = withTxn(() => {
+      db.prepare('UPDATE orders SET customer_id = ?, updated_at = ? WHERE id = ?')
+        .run(customer_id || null, nowStr, req.params.id);
+
+      // Keep every unpaid guest check attached to the same customer.
+      db.prepare("UPDATE bills SET customer_id = ?, updated_at = ? WHERE order_id = ? AND payment_status != 'paid'")
+        .run(customer_id || null, nowStr, req.params.id);
+
+      return parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id)) as any;
+    });
+
+    const customer = updatedOrder.customer_id
+      ? db.prepare('SELECT * FROM customers WHERE id = ?').get(updatedOrder.customer_id)
+      : null;
+
+    cloudSync.recordOrderChanged(req.params.id as string, 'order.updated');
+    notifyOrderUpdated();
+
+    res.json({ order: { ...updatedOrder, customer } });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+router.patch('/:id/convert-to-takeaway', requireRole('owner', 'manager', 'cashier', 'waiter'), (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const nowStr = now();
+
+    withTxn(() => {
+      const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
+      if (!order) {
+        throw Object.assign(new Error('Order not found'), { statusCode: 404 });
+      }
+      if (order.type !== 'dine_in') {
+        throw Object.assign(new Error('Only dine-in orders can be converted to takeaway'), { statusCode: 400 });
+      }
+      if (['completed', 'cancelled'].includes(order.status)) {
+        throw Object.assign(new Error('Cannot convert a completed or cancelled order'), { statusCode: 400 });
+      }
+      if (db.prepare('SELECT 1 FROM bills WHERE order_id = ? AND split_group_id IS NOT NULL LIMIT 1').get(req.params.id)) {
+        throw Object.assign(new Error('A split dine-in check cannot be converted to takeaway'), { statusCode: 409 });
+      }
+
+      db.prepare("UPDATE orders SET type = 'takeaway', table_id = NULL, updated_at = ? WHERE id = ?")
+        .run(nowStr, req.params.id);
+
+      if (order.table_id) {
+        db.prepare("UPDATE tables SET status = 'available', updated_at = ? WHERE id = ?")
+          .run(nowStr, order.table_id);
+      }
+      return order.table_id;
+    });
+
+    const updatedOrder = parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id)) as any;
+    const orderItems = attachEffectiveAddons(db, db.prepare('SELECT * FROM order_items WHERE order_id = ?').all(req.params.id).map(parseItemJson) as any[]);
+
+    cloudSync.recordOrderChanged(req.params.id as string, 'order.type_changed');
+    notifyKdsUpdate();
+
+    res.json({ order: Object.assign({}, updatedOrder, { items: orderItems, table: null }) });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
+  }
+});
+
+router.patch('/:id/discount', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (db.prepare('SELECT 1 FROM bills WHERE order_id = ? AND split_group_id IS NOT NULL LIMIT 1').get(req.params.id)) {
+      return res.status(409).json({ error: 'Discounts cannot be changed after a check has been split' });
+    }
+
+    // Cannot apply discount to completed or cancelled orders
+    if (['completed', 'cancelled'].includes(order.status)) {
+      return res.status(400).json({ error: 'Cannot apply discount to a completed or cancelled order' });
+    }
+
+    const { discount_type, discount_value, discount_reason } = req.body || {};
+
+    // Validate discount_type
+    if (discount_value !== 0 && (!discount_type || !['percentage', 'amount'].includes(discount_type))) {
+      return res.status(400).json({ error: 'discount_type must be "percentage" or "amount"' });
+    }
+
+    // Validate discount_value is a non-negative finite number
+    if (discount_value === undefined || discount_value === null || typeof discount_value !== 'number' || discount_value < 0 || !Number.isFinite(discount_value)) {
+      return res.status(400).json({ error: 'discount_value must be a non-negative number' });
+    }
+
+    // Check if approval is required
+    if (discount_value > 0) {
+      const requiresApproval = getSettingValue('discount_requires_approval') === 'true';
+      if (requiresApproval) {
+        const { override_pin } = req.body || {};
+        if (!override_pin) {
+          return res.status(403).json({ error: 'Manager PIN required for discounts', requiresApproval: true });
+        }
+        const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+        const rateLimitKey = `pin:${clientIp}:discount`;
+        if (!checkPinRateLimit(rateLimitKey)) {
+          return res.status(429).json({ error: 'Too many PIN attempts. Try again in 15 minutes.' });
+        }
+        const user = db.prepare("SELECT * FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL AND role IN ('owner', 'manager')")
+          .all()
+          .find((u: any) => verifyPin(u.pin_hash, override_pin));
+        if (!user) {
+          return res.status(403).json({ error: 'Invalid manager PIN' });
+        }
+      }
+    }
+
+    // Check discount mode
+    if (discount_value > 0) {
+      const discountMode = getSettingValue('discount_mode') || 'percentage';
+      if (discountMode === 'flat' && discount_type === 'percentage') {
+        return res.status(400).json({ error: 'Percentage discounts are disabled' });
+      }
+      if (discountMode === 'percentage' && discount_type === 'amount') {
+        return res.status(400).json({ error: 'Flat amount discounts are disabled' });
+      }
+    }
+
+    // Check against limits from settings (0 = no limit)
+    if (discount_value > 0) {
+      if (discount_type === 'percentage') {
+        const maxPercentage = parseFloat(getSettingValue('discount_max_percentage') || '25');
+        if (maxPercentage > 0 && discount_value > maxPercentage) {
+          return res.status(400).json({ error: `discount_value exceeds maximum percentage of ${maxPercentage}` });
+        }
+      } else if (discount_type === 'amount') {
+        const maxAmount = parseFloat(getSettingValue('discount_max_amount') || '0');
+        if (maxAmount > 0 && discount_value > maxAmount) {
+          return res.status(400).json({ error: `discount_value exceeds maximum amount of ${maxAmount}` });
+        }
+      }
+    }
+    const tenantInfo = {
+      country: getSettingValue('country') || 'IN',
+      business_type: getSettingValue('business_type') || 'restaurant',
+      state_code: getSettingValue('state_code') || '',
+      taxes_enabled: getSettingValue('taxes_enabled') === 'true',
+    };
+    // BUG #6 FIX: Wrap discount + tax + bill sync in a transaction
+    const result = withTxn(() => {
+      // Re-fetch and re-validate under the transaction lock: another request (e.g. a
+      // concurrent item add/void, or the order being completed/cancelled) can race the
+      // checks above and change status/subtotal before this lock is acquired (#175).
+      const currentOrder = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
+      if (!currentOrder) {
+        throw Object.assign(new Error('Order not found'), { statusCode: 404 });
+      }
+      if (['completed', 'cancelled'].includes(currentOrder.status)) {
+        throw Object.assign(new Error('Cannot apply discount to a completed or cancelled order'), { statusCode: 400 });
+      }
+
+      const customer = currentOrder.customer_id
+        ? db.prepare('SELECT * FROM customers WHERE id = ?').get(currentOrder.customer_id) as any
+        : null;
+
+      // Calculate discount amount
+      let discountAmount = 0;
+      if (discount_value > 0) {
+        if (discount_type === 'percentage') {
+          discountAmount = (currentOrder.subtotal * discount_value) / 100;
+        } else {
+          discountAmount = Math.min(discount_value, currentOrder.subtotal);
+        }
+        discountAmount = Math.round(discountAmount * 100) / 100;
+      }
+
+      // Always recalculate tax from item-level data (not by scaling the already-discounted
+      // order.tax_amount from the DB), otherwise repeated discount updates compound the
+      // reduction each time this endpoint is called.
+      const activeItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status != 'cancelled'").all(req.params.id) as any[];
+      let freshTax = 0;
+      let exclusiveTax = 0;
+      const allTaxBreakdowns: any[] = [];
+      const allTaxSnapshots: (string | null)[] = [];
+      for (const item of activeItems) {
+        freshTax += item.tax_amount || 0;
+        if (item.tax_type !== 'inclusive') {
+          exclusiveTax += item.tax_amount || 0;
+        }
+        if (item.tax_breakdown) {
+          try {
+            const breakdown = JSON.parse(item.tax_breakdown);
+            if (Array.isArray(breakdown)) allTaxBreakdowns.push(breakdown);
+          } catch { }
+        }
+        allTaxSnapshots.push(item.tax_snapshot || null);
+      }
+      let newTaxAmount = freshTax;
+      let newExclusiveTax = exclusiveTax;
+      let taxRatio = 1;
+      if (discountAmount > 0 && currentOrder.subtotal > 0) {
+        const discountedSubtotal = Math.max(0, currentOrder.subtotal - discountAmount);
+        taxRatio = discountedSubtotal / currentOrder.subtotal;
+        newTaxAmount = Math.round(freshTax * taxRatio * 100) / 100;
+        newExclusiveTax = Math.round(exclusiveTax * taxRatio * 100) / 100;
+      }
+
+      const discountedSubtotal = Math.max(0, currentOrder.subtotal - discountAmount);
+      const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, {
+        ...currentOrder,
+        service_charge: 0,
+      }, customer);
+      const taxRollup = combineItemAndChargeTaxes({
+        itemTaxAmount: newTaxAmount,
+        itemExclusiveTaxAmount: newExclusiveTax,
+        itemBreakdowns: allTaxBreakdowns,
+        itemSnapshots: allTaxSnapshots,
+        itemTaxRatio: taxRatio,
+        chargeTaxes,
+      });
+      const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
+        + (currentOrder.packaging_charge || 0) + (currentOrder.delivery_charge || 0);
+      const newTotal = Number(preRoundTotal.toFixed(2));
+      const roundOff = 0;
+
+      db.prepare(`
+        UPDATE orders SET discount_amount = ?, discount_type = ?, discount_value = ?,
+          discount_reason = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, total = ?, round_off = ?, updated_at = ? WHERE id = ?
+      `).run(
+        discountAmount,
+        discount_value > 0 ? discount_type : null,
+        discount_value > 0 ? discount_value : null,
+        discount_value > 0 ? (discount_reason || null) : null,
+        taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, newTotal, roundOff, now(), req.params.id
+      );
+
+      // Sync discount to bill if it exists and is unpaid
+      const existingBill = db.prepare('SELECT * FROM bills WHERE order_id = ? AND payment_status != ?')
+        .get(req.params.id, 'paid') as any;
+      if (existingBill) {
+        const pack = getActiveCountryPack(tenantInfo.country);
+        const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(newTotal, pack);
+        const newBillBalance = Math.max(0, billTotal - (existingBill.paid_amount || 0));
+        db.prepare(`
+          UPDATE bills SET discount_amount = ?, discount_type = ?, discount_value = ?,
+            discount_reason = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, total = ?, balance = ?, round_off = ?, updated_at = ?
+          WHERE id = ?
+        `).run(
+          discountAmount,
+          discount_value > 0 ? discount_type : null,
+          discount_value > 0 ? discount_value : null,
+          discount_value > 0 ? (discount_reason || null) : null,
+          taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, billTotal, newBillBalance, billRoundOff, now(), existingBill.id
+        );
+      }
+
+      const updatedOrder = parseRowJson(db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id)) as any;
+      return updatedOrder;
+    });
+
+    notifyOrderUpdated();
+    res.json({ order: result });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
+  }
+});
+
+router.patch('/:id/items/:itemId/discount', requireRole('owner', 'manager'), (req: Request, res: Response) => {
+  try {
+    const db = getDatabase();
+    const order = db.prepare('SELECT * FROM orders WHERE id = ?').get(req.params.id) as any;
+    if (!order) {
+      return res.status(404).json({ error: 'Order not found' });
+    }
+    if (db.prepare('SELECT 1 FROM bills WHERE order_id = ? AND split_group_id IS NOT NULL LIMIT 1').get(req.params.id)) {
+      return res.status(409).json({ error: 'Discounts cannot be changed after a check has been split' });
+    }
+
+    // Cannot apply discount to completed or cancelled orders
+    if (['completed', 'cancelled'].includes(order.status)) {
+      return res.status(400).json({ error: 'Cannot apply discount to a completed or cancelled order' });
+    }
+
+    const item = db.prepare('SELECT * FROM order_items WHERE id = ? AND order_id = ?').get(req.params.itemId, req.params.id) as any;
+    if (!item) {
+      return res.status(404).json({ error: 'Item not found' });
+    }
+
+    const { discount_type, discount_value } = req.body;
+
+    // Validate discount_type
+    if (!discount_type || !['percentage', 'amount'].includes(discount_type)) {
+      return res.status(400).json({ error: 'discount_type must be "percentage" or "amount"' });
+    }
+
+    // Validate discount_value is a positive number
+    if (discount_value === undefined || discount_value === null || typeof discount_value !== 'number' || discount_value <= 0) {
+      return res.status(400).json({ error: 'discount_value must be a positive number' });
+    }
+
+    // Check if approval is required
+    const requiresApproval = getSettingValue('discount_requires_approval') === 'true';
+    if (requiresApproval) {
+      const { override_pin } = req.body;
+      if (!override_pin) {
+        return res.status(403).json({ error: 'Manager PIN required for discounts', requiresApproval: true });
+      }
+      const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+      const rateLimitKey = `pin:${clientIp}:item-discount`;
+      if (!checkPinRateLimit(rateLimitKey)) {
+        return res.status(429).json({ error: 'Too many PIN attempts. Try again in 15 minutes.' });
+      }
+      const user = db.prepare("SELECT * FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL AND role IN ('owner', 'manager')")
+        .all()
+        .find((u: any) => verifyPin(u.pin_hash, override_pin));
+      if (!user) {
+        return res.status(403).json({ error: 'Invalid manager PIN' });
+      }
+    }
+
+    // Check discount mode
+    const discountMode = getSettingValue('discount_mode') || 'percentage';
+    if (discountMode === 'flat' && discount_type === 'percentage') {
+      return res.status(400).json({ error: 'Percentage discounts are disabled' });
+    }
+    if (discountMode === 'percentage' && discount_type === 'amount') {
+      return res.status(400).json({ error: 'Flat amount discounts are disabled' });
+    }
+
+    // BUG #14 FIX: Check item-level discount against max settings (0 = no limit)
+    if (discount_type === 'percentage') {
+      const maxPercentage = parseFloat(getSettingValue('discount_max_percentage') || '25');
+      if (maxPercentage > 0 && discount_value > maxPercentage) {
+        return res.status(400).json({ error: `discount_value exceeds maximum percentage of ${maxPercentage}` });
+      }
+    } else if (discount_type === 'amount') {
+      const maxAmount = parseFloat(getSettingValue('discount_max_amount') || '0');
+      if (maxAmount > 0 && discount_value > maxAmount) {
+        return res.status(400).json({ error: `discount_value exceeds maximum amount of ${maxAmount}` });
+      }
+    }
+
+    // Calculate item discount amount (include addon prices)
+    const addonRows = db.prepare('SELECT price, quantity FROM order_item_addons WHERE order_item_id = ?').all(item.id) as { price: number; quantity?: number }[];
+    const addonTotal = addonRows.reduce((sum, addon) => sum + (addon.price || 0) * (addon.quantity || 1) * item.quantity, 0);
+    const itemBaseTotal = item.unit_price * item.quantity + addonTotal;
+
+    let discountAmount: number;
+    if (discount_type === 'percentage') {
+      discountAmount = (itemBaseTotal * discount_value) / 100;
+    } else {
+      discountAmount = Math.min(discount_value, itemBaseTotal);
+    }
+    discountAmount = Math.round(discountAmount * 100) / 100;
+
+    // Recalculate item subtotal after discount
+    const newSubtotal = Math.max(0, itemBaseTotal - discountAmount);
+
+    // Recalculate tax on discounted subtotal
+    const product = db.prepare('SELECT * FROM products WHERE id = ?').get(item.product_id) as any;
+    const customer = order.customer_id ? db.prepare('SELECT * FROM customers WHERE id = ?').get(order.customer_id) as any : null;
+    const settings = db.prepare("SELECT * FROM settings WHERE key IN ('country', 'business_type', 'state_code', 'taxes_enabled')").all() as any[];
+    const settingsMap = Object.fromEntries(settings.map((s: any) => [s.key, s.value]));
+    const tenantInfo = {
+      country: settingsMap.country || 'IN',
+      business_type: settingsMap.business_type || 'restaurant',
+      state_code: settingsMap.state_code || '',
+      taxes_enabled: settingsMap.taxes_enabled === 'true',
+    };
+    const taxResult = calculateItemTax(tenantInfo, product, newSubtotal, customer);
+    const newTaxAmount = taxResult.tax_amount;
+    const newTaxBreakdown = taxResult.tax_breakdown;
+    const newTaxSnapshotJson = taxResult.tax_snapshot ? JSON.stringify(taxResult.tax_snapshot) : null;
+
+    const newTotal = newSubtotal + (taxResult.tax_type === 'inclusive' ? 0 : newTaxAmount);
+
+    const updatedItem = withTxn(() => {
+      // Update item with recalculated tax
+      db.prepare(`
+        UPDATE order_items SET discount_amount = ?,
+          subtotal = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, tax_type = ?,
+          total = ?, updated_at = ? WHERE id = ?
+      `).run(
+        discountAmount, newSubtotal, newTaxAmount, JSON.stringify(newTaxBreakdown),
+        newTaxSnapshotJson, taxResult.tax_type, newTotal, now(), req.params.itemId,
+      );
+
+      // Update order totals (preserve existing order-level discount)
+      // Note: status != 'cancelled' — a cancelled item's tax must not re-enter
+      // the order total here, same filter every other recompute site in this
+      // file already uses (BUG #3 FIX above, index.ts cancel/restore below).
+      const allItems = db.prepare("SELECT * FROM order_items WHERE order_id = ? AND status != 'cancelled'").all(req.params.id) as any[];
+      let orderSubtotal = 0;
+      let orderTax = 0;
+      let exclusiveOrderTax = 0;
+      const allTaxBreakdowns: any[] = [];
+      const allTaxSnapshots: (string | null)[] = [];
+      for (const i of allItems) {
+        orderSubtotal += i.subtotal;
+        orderTax += i.tax_amount;
+        if (i.tax_type !== 'inclusive') {
+          exclusiveOrderTax += i.tax_amount;
+        }
+        if (i.tax_breakdown) {
+          try {
+            const breakdown = JSON.parse(i.tax_breakdown);
+            if (Array.isArray(breakdown)) allTaxBreakdowns.push(breakdown);
+          } catch { }
+        }
+        allTaxSnapshots.push(i.tax_snapshot || null);
+      }
+
+      // Recalculate order-level discount proportionally on new subtotal
+      const existingDiscountAmount = order.discount_amount || 0;
+      let newOrderDiscount = existingDiscountAmount;
+      if (existingDiscountAmount > 0 && order.subtotal > 0) {
+        // Scale discount proportionally to new subtotal
+        newOrderDiscount = Math.round(existingDiscountAmount * (orderSubtotal / order.subtotal) * 100) / 100;
+      }
+
+      // Recalculate tax on discounted subtotal
+      const discountedSubtotal = Math.max(0, orderSubtotal - newOrderDiscount);
+      let newOrderTax = orderTax;
+      let newExclusiveOrderTax = exclusiveOrderTax;
+      let taxRatio = 1;
+      if (newOrderDiscount > 0 && orderSubtotal > 0) {
+        taxRatio = discountedSubtotal / orderSubtotal;
+        newOrderTax = Math.round(orderTax * taxRatio * 100) / 100;
+        newExclusiveOrderTax = Math.round(exclusiveOrderTax * taxRatio * 100) / 100;
+      }
+
+      const chargeTaxes = calculateConfiguredChargeTaxes(tenantInfo, {
+        ...order,
+        service_charge: 0,
+      }, customer);
+      const taxRollup = combineItemAndChargeTaxes({
+        itemTaxAmount: newOrderTax,
+        itemExclusiveTaxAmount: newExclusiveOrderTax,
+        itemBreakdowns: allTaxBreakdowns,
+        itemSnapshots: allTaxSnapshots,
+        itemTaxRatio: taxRatio,
+        chargeTaxes,
+      });
+      const preRoundTotal = discountedSubtotal + taxRollup.exclusiveTaxAmount
+        + (order.packaging_charge || 0) + (order.delivery_charge || 0);
+      const orderTotal = Number(preRoundTotal.toFixed(2));
+      const roundOff = 0;
+
+      db.prepare(`
+        UPDATE orders SET subtotal = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, total = ?, round_off = ?, updated_at = ? WHERE id = ?
+      `).run(orderSubtotal, taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, newOrderDiscount, orderTotal, roundOff, now(), req.params.id);
+
+      // BUG #15 FIX: Sync item-level discount to bill
+      const existingBill = db.prepare("SELECT * FROM bills WHERE order_id = ? AND payment_status != 'paid'").get(req.params.id) as any;
+      if (existingBill) {
+        const pack = getActiveCountryPack(tenantInfo.country);
+        const { total: billTotal, adjustment: billRoundOff } = applyPayableRounding(orderTotal, pack);
+        const newBillBalance = Math.max(0, billTotal - (existingBill.paid_amount || 0));
+        db.prepare(`UPDATE bills SET total = ?, balance = ?, tax_amount = ?, tax_breakdown = ?, tax_snapshot = ?, discount_amount = ?, round_off = ?, updated_at = ? WHERE id = ?`)
+          .run(billTotal, newBillBalance, taxRollup.taxAmount, JSON.stringify(taxRollup.breakdowns), taxRollup.snapshotJson, newOrderDiscount, billRoundOff, now(), existingBill.id);
+      }
+
+      return db.prepare('SELECT * FROM order_items WHERE id = ?').get(req.params.itemId) as any;
+    });
+
+    res.json({ item: updatedItem });
+  } catch (error: any) {
+    console.error("[API] Internal error:", error);
+    res.status(error.statusCode || 500).json({ error: error.statusCode ? error.message : "Internal server error" });
+  }
+});
+
+export const orderRoutes = router;
